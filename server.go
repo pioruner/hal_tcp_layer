@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
+	"sync"
+	"time"
 )
 
 type Packer struct {
@@ -24,11 +27,14 @@ func unpackFromBytes(data []byte) (Packer, error) {
 }
 
 func packData(p Packer) ([]byte, error) {
+	tmp_p := p
+	tmp_p.F1 += 1
+	tmp_p.F2 += 2.22222
 	// Создаем буфер для хранения байт
 	buf := new(bytes.Buffer)
 
 	// Пишем данные структуры в буфер
-	err := binary.Write(buf, binary.BigEndian, p)
+	err := binary.Write(buf, binary.BigEndian, tmp_p)
 	if err != nil {
 		return nil, err
 	}
@@ -42,9 +48,60 @@ func receivePack(conn net.Conn) (Packer, error) {
 	data := make([]byte, 16) // float64 занимает 8 байт, 2 float64 = 16 байт
 	_, err := conn.Read(data)
 	if err != nil {
+		if err == io.EOF {
+			fmt.Println("Client closed connection")
+		}
 		return Packer{}, err
 	}
 	return unpackFromBytes(data)
+}
+
+// Обработка каждого подключения в отдельной горутине
+func handleConnection(conn net.Conn, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	// Устанавливаем таймаут на чтение и запись
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+
+	for {
+		p, err := receivePack(conn)
+		if err != nil {
+			// Если клиент закрыл соединение
+			if err == io.EOF {
+				break
+			}
+			fmt.Println("Error receiving Packer:", err)
+			break
+		}
+
+		// Выводим полученные данные от клиента
+		fmt.Printf("Received Packer from client: %+v\n", p)
+
+		// Пакуем данные и отправляем обратно
+		buf, err := packData(p)
+		if err != nil {
+			fmt.Println("Error packing data:", err)
+			break
+		}
+
+		_, err = conn.Write(buf)
+		if err != nil {
+			fmt.Println("Error writing response:", err)
+			break
+		}
+
+		// Выводим данные, которые были отправлены обратно клиенту
+		fmt.Printf("Sent back to client: %+v\n", p)
+
+		// Сбрасываем таймауты после каждой успешной операции
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	}
+
+	// Сообщаем о закрытии соединения только один раз
+	fmt.Println("Closing connection with client...")
+	conn.Close()
 }
 
 func main() {
@@ -57,30 +114,26 @@ func main() {
 
 	fmt.Println("Server is listening...")
 
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 100) // Ограничение на количество одновременных подключений (например, 100)
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			fmt.Println("Error accepting connection:", err)
 			continue
 		}
-		defer conn.Close()
 
-		p, err := receivePack(conn)
-		if err != nil {
-			fmt.Println("Error receiving Packer:", err)
-			continue
-		}
+		// Используем семафор для ограничения одновременных подключений
+		sem <- struct{}{}
+		wg.Add(1)
 
-		// Выводим пакет в консоль в hex формате
-		fmt.Printf("Received Packer: %+v\n", p)
-		buf, err := packData(p)
-		if err == nil {
-			_, err := conn.Write(buf)
-			if err != nil {
-				fmt.Println("Error receiving Packer:", err)
-				continue
-			}
-		}
-
+		go func(conn net.Conn) {
+			defer func() { <-sem }()
+			handleConnection(conn, &wg)
+		}(conn)
 	}
+
+	// Ожидаем завершения всех горутин
+	wg.Wait()
 }
